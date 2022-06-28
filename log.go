@@ -1,30 +1,29 @@
 package log
 
-
 func P(args ...interface{}) {
-	log.Panic(args)
+	log.Panic(args...)
 }
 
 func F(args ...interface{}) {
-	log.Fatal(args)
+	log.Fatal(args...)
 }
 
 func E(args ...interface{}) {
-	log.Error(args)
+	log.Error(args...)
 }
 
 func W(args ...interface{}) {
-	log.Warn(args)
+	log.Warn(args...)
 }
 
 func I(args ...interface{}) {
-	log.Info(args)
+	log.Info(args...)
 }
 
 func D(args ...interface{}) {
-	log.Debug(args)
+	log.Debug(args...)
 }
 
 func T(args ...interface{}) {
-	log.Trace(args)
+	log.Trace(args...)
 }

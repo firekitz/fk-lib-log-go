@@ -1,12 +1,14 @@
 package log
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"time"
-
-	"github.com/gomodule/redigo/redis"
+	fkBootstrap "github.com/firekitz/fk-lib-bootstrap-go"
+	"github.com/go-redis/redis/v8"
 	"github.com/sirupsen/logrus"
+	"time"
 )
 
 // log Example
@@ -19,33 +21,17 @@ type HookConfig struct {
 	Key      string
 	Host     string
 	Password string
-	Port     int
-	DB       int
-	TTL      int
+	Port     string
 }
 
 // RedisHook to sends logs to Redis server
 type RedisHook struct {
-	RedisPool   *redis.Pool
-	RedisHost   string
+	RedisClient *redis.Client
 	RedisKey    string
-	RedisPort   int
-	TTL         int
-	DialOptions []redis.DialOption
 }
 
-// Init config := HookConfig{
-//	Host:     "redis host",
-//	Key:      "key",
-//	Password: "password",
-//	Port:     6379,
-//	DB:       0,
-//	TTL:      3600,
-//}
-//
-// var label []string = {"domainId, appId, env, slackId"}
-func Init(config HookConfig, label []string) error {
-	Label = label
+// Init with config
+func Init(env interface{}, TLS bool) (*RedisHook, error) {
 	logRedis := logrus.New()
 	logRedis.SetLevel(logrus.DebugLevel)
 	logRedis.SetLevel(logrus.TraceLevel)
@@ -57,6 +43,11 @@ func Init(config HookConfig, label []string) error {
 			"caller": "caller",
 		},
 	})
+
+	label, err := getLabel(env)
+	if err != nil {
+		return nil, err
+	}
 	log = logRedis.WithFields(logrus.Fields{
 		"meta": logrus.Fields{
 			"label":     label,
@@ -64,36 +55,57 @@ func Init(config HookConfig, label []string) error {
 		},
 	})
 
-	hook, err := NewHook(config)
+	config, err := getConfig(env)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	hook, err := newHook(config, TLS)
+	if err != nil {
+		return nil, err
 	}
 	logRedis.AddHook(hook)
-	return nil
+	return hook, nil
 }
 
-// NewHook creates a hook to be added to an instance of logger
-func NewHook(config HookConfig, options ...redis.DialOption) (*RedisHook, error) {
-	pool := newRedisConnectionPool(config.Host, config.Password, config.Port, config.DB, options...)
-
-	// test if connection with REDIS can be established
-	conn := pool.Get()
-	defer conn.Close()
-
-	// check connection
-	_, err := conn.Do("PING")
+func getConfig(env interface{}) (HookConfig, error) {
+	var field []string
+	field = append(field, "REDIS_LOG_HOST", "REDIS_LOG_PASSWORD", "REDIS_LOG_PORT", "REDIS_LOG_CONTAINER")
+	res, err := fkBootstrap.GetFieldFromStruct(env, field)
 	if err != nil {
-		return nil, fmt.Errorf("unable to connect to REDIS: %s", err)
+		return HookConfig{}, fmt.Errorf("fk-lib-log-go struct error: %v", err)
+	}
+	return HookConfig{
+		Key:      res["REDIS_LOG_CONTAINER"],
+		Host:     res["REDIS_LOG_HOST"],
+		Password: res["REDIS_LOG_PASSWORD"],
+		Port:     res["REDIS_LOG_PORT"],
+	}, nil
+}
+
+func getLabel(env interface{}) ([]string, error) {
+	var field []string
+	field = append(field, "DOMAIN_ID", "SERVICE_NAME", "ENV", "PROJECT_OWNER_SLACK_ID")
+	res, err := fkBootstrap.GetFieldFromStruct(env, field)
+	if err != nil {
+		return nil, fmt.Errorf("fk-lib-log-go struct error: %v", err)
 	}
 
-	return &RedisHook{
-		RedisHost:   config.Host,
-		RedisPool:   pool,
-		RedisKey:    config.Key,
-		TTL:         config.TTL,
-		DialOptions: options,
-	}, nil
+	var label []string
+	label = append(label, res["DOMAIN_ID"], res["SERVICE_NAME"], res["ENV"], res["PROJECT_OWNER_SLACK_ID"])
+	return label, nil
+}
 
+// newHook creates a hook to be added to an instance of logger
+func newHook(config HookConfig, TLS bool) (*RedisHook, error) {
+	client := newClient(config, TLS)
+
+	if _, err := client.Ping(context.Background()).Result(); err != nil {
+		return nil, fmt.Errorf("fk-lib-log-go error: %v", err)
+	}
+	return &RedisHook{
+		RedisClient: client,
+		RedisKey:    config.Key,
+	}, nil
 }
 
 func makeMessage(entry *logrus.Entry) map[string]interface{} {
@@ -115,29 +127,18 @@ func (hook *RedisHook) Fire(entry *logrus.Entry) error {
 		},
 	})
 	data := makeMessage(entry)
-
-	// Marshal into json message
 	js, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("error creating message for REDIS: %s", err)
 	}
-	// get connection from pool
-	conn := hook.RedisPool.Get()
-	defer conn.Close()
-
-	// send message
-	_, err = conn.Do("RPUSH", hook.RedisKey, js)
-	if err != nil {
-		return fmt.Errorf("error sending message to REDIS: %s", err)
+	if _, err = hook.RedisClient.RPush(context.Background(), hook.RedisKey, js).Result(); err != nil {
+		return fmt.Errorf("error pushing message for REDIS: %s", err)
 	}
-
-	if hook.TTL != 0 {
-		_, err = conn.Do("EXPIRE", hook.RedisKey, hook.TTL)
-		if err != nil {
-			return fmt.Errorf("error setting TTL to key: %s, %s", hook.RedisKey, err)
-		}
-	}
-
+	//if hook.TTL != 0 {
+	//	if _, err = hook.RedisClient.Expire(context.Background(), hook.RedisKey, time.Duration(hook.TTL)).Result(); err != nil {
+	//		return fmt.Errorf("error setting TTL to key: %s, %s", hook.RedisKey, err)
+	//	}
+	//}
 	return nil
 }
 
@@ -154,25 +155,26 @@ func (hook *RedisHook) Levels() []logrus.Level {
 	}
 }
 
-func newRedisConnectionPool(server, password string, port int, db int, options ...redis.DialOption) *redis.Pool {
-	hostPort := fmt.Sprintf("%s:%d", server, port)
-	return &redis.Pool{
-		MaxIdle:     3,
-		IdleTimeout: 240 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			dialOptions := append([]redis.DialOption{
-				redis.DialDatabase(db),
-				redis.DialPassword(password),
-			}, options...)
-			c, err := redis.Dial("tcp", hostPort, dialOptions...)
-			if err != nil {
-				return nil, err
-			}
-			return c, err
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			_, err := c.Do("PING")
-			return err
-		},
+func newClient(config HookConfig, TLS bool) *redis.Client {
+	if TLS {
+		return redis.NewClient(&redis.Options{
+			Addr:      config.Host + ":" + config.Port,
+			Password:  config.Password,
+			DB:        0,
+			TLSConfig: new(tls.Config),
+		})
+	} else {
+		return redis.NewClient(&redis.Options{
+			Addr:     config.Host + ":" + config.Port,
+			Password: config.Password,
+			DB:       0,
+		})
 	}
+}
+
+func (hook *RedisHook) Shutdown() error {
+	if err := hook.RedisClient.Close(); err != nil {
+		return fmt.Errorf("fk-lib-log-go shutdown error: %v", err)
+	}
+	return nil
 }
